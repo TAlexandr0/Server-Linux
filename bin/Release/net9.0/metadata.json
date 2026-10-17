@@ -1,0 +1,6 @@
+{
+  "name": "OpenRevitServer - Revit Server on Linux",
+  "description": "Engineering workbench, protocol reverse-engineering specification, interactive mock server, and Linux deployment toolkit for building a native Revit Server compatible daemon.",
+  "requestFramePermissions": [],
+  "majorCapabilities": ["MAJOR_CAPABILITY_SERVER_SIDE_GEMINI_API"]
+}

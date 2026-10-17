@@ -1,0 +1,16 @@
+services:
+  revit-server-corewcf:
+    build:
+      context: .
+      dockerfile: Dockerfile
+    container_name: revit-server-corewcf
+    restart: unless-stopped
+    ports:
+      # WCF NetTcpBinding (tcpbuffer) - Used by Revit Desktop
+      - "808:808"
+      # REST API - Used for Admin and Discovery
+      - "80:80"
+      # Alternative port
+      - "3000:3000"
+    environment:
+      - ASPNETCORE_ENVIRONMENT=Production

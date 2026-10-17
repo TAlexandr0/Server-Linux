@@ -1,0 +1,16 @@
+services:
+  open-revit-server:
+    build:
+      context: .
+      dockerfile: Dockerfile
+    restart: unless-stopped
+    ports:
+      # WCF NetTcpBinding (tcpbuffer) - Used by Revit Desktop for ModelService
+      - "808:808"
+      # REST API - Standard HTTP port for AdminRESTService
+      - "80:80"
+      # Web Administration Dashboard
+      - "3000:3000"
+    environment:
+      - ASPNETCORE_ENVIRONMENT=Production
+      - REVIT_SERVER_VERSION=AUTO
