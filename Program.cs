@@ -10,6 +10,8 @@ using System.Collections.Generic;
 using System.IO;
 using System.Linq;
 using System.Net;
+using System.Runtime.Serialization;
+using System.Text;
 using System.Text.RegularExpressions;
 using System.Xml;
 
@@ -688,6 +690,263 @@ public class ServerModelItem
 
 public static class ServerState
 {
+    public static Dictionary<string, byte[]> ExtractOleStreams(byte[] cfbfBytes)
+    {
+        var result = new Dictionary<string, byte[]>(StringComparer.OrdinalIgnoreCase);
+        if (cfbfBytes == null || cfbfBytes.Length < 512) return result;
+        if (cfbfBytes[0] != 0xD0 || cfbfBytes[1] != 0xCF || cfbfBytes[2] != 0x11 || cfbfBytes[3] != 0xE0 ||
+            cfbfBytes[4] != 0xA1 || cfbfBytes[5] != 0xB1 || cfbfBytes[6] != 0x1A || cfbfBytes[7] != 0xE1)
+        {
+            return result;
+        }
+
+        try {
+            ushort sectorShift = BitConverter.ToUInt16(cfbfBytes, 30);
+            int sectorSize = 1 << sectorShift;
+            int fatSectorsCount = BitConverter.ToInt32(cfbfBytes, 44);
+            int dirFirstSector = BitConverter.ToInt32(cfbfBytes, 48);
+
+            List<int> fat = new List<int>();
+            for (int i = 0; i < fatSectorsCount; i++)
+            {
+                int fatSecIndex = BitConverter.ToInt32(cfbfBytes, 76 + i * 4);
+                int fatSecOffset = (fatSecIndex + 1) * sectorSize;
+                int entriesInSector = sectorSize / 4;
+                for (int e = 0; e < entriesInSector; e++)
+                {
+                    if (fatSecOffset + e * 4 + 4 <= cfbfBytes.Length)
+                        fat.Add(BitConverter.ToInt32(cfbfBytes, fatSecOffset + e * 4));
+                }
+            }
+
+            byte[] ReadSectorChain(int startSector, long streamSize)
+            {
+                using var ms = new MemoryStream();
+                int curr = startSector;
+                while (curr >= 0 && curr < fat.Count && ms.Length < streamSize)
+                {
+                    int offset = (curr + 1) * sectorSize;
+                    int bytesToRead = (int)Math.Min(sectorSize, streamSize - ms.Length);
+                    if (offset + bytesToRead <= cfbfBytes.Length)
+                    {
+                        ms.Write(cfbfBytes, offset, bytesToRead);
+                    }
+                    curr = fat[curr];
+                }
+                return ms.ToArray();
+            }
+
+            byte[] dirData = ReadSectorChain(dirFirstSector, cfbfBytes.Length);
+            int dirEntriesCount = dirData.Length / 128;
+
+            for (int d = 0; d < dirEntriesCount; d++)
+            {
+                int entryOffset = d * 128;
+                ushort nameLen = BitConverter.ToUInt16(dirData, entryOffset + 64);
+                byte objType = dirData[entryOffset + 66];
+
+                if (nameLen > 2 && (objType == 2 || objType == 5))
+                {
+                    string name = Encoding.Unicode.GetString(dirData, entryOffset, nameLen - 2);
+                    int startSector = BitConverter.ToInt32(dirData, entryOffset + 116);
+                    long streamSize = BitConverter.ToInt64(dirData, entryOffset + 120);
+
+                    if (objType == 2 && streamSize > 0 && startSector >= 0)
+                    {
+                        byte[] data = ReadSectorChain(startSector, streamSize);
+                        result[name] = data;
+                    }
+                }
+            }
+        } catch { }
+
+        return result;
+    }
+
+    public static byte[] GetModelStreamBytes(ServerModelItem model, string requestedFile, string clientMachine, string userName, string effectiveVersion)
+    {
+        string lowerReq = (requestedFile ?? "").ToLowerInvariant();
+
+        if (lowerReq.EndsWith("/o") || lowerReq.EndsWith(@"\o") || lowerReq.Equals("o") ||
+            lowerReq.Contains("basicfileinfo"))
+        {
+            return GenerateBasicFileInfo(
+                clientMachine,
+                model.Path,
+                model.ModelGuid,
+                !string.IsNullOrEmpty(model.Version) ? model.Version : effectiveVersion,
+                !string.IsNullOrEmpty(userName) ? userName : "Architect"
+            );
+        }
+
+        string diskPath = GetModelDiskPath(model.Path);
+        if (File.Exists(diskPath))
+        {
+            byte[] diskBytes = File.ReadAllBytes(diskPath);
+            var streams = ExtractOleStreams(diskBytes);
+            if (streams.Count > 0)
+            {
+                if (lowerReq.Contains("contents"))
+                {
+                    if (streams.TryGetValue("Contents", out var cData)) return cData;
+                }
+                else if (lowerReq.Contains("projectinformation"))
+                {
+                    if (streams.TryGetValue("ProjectInformation", out var pData)) return pData;
+                }
+                else if (lowerReq.Contains("transmissiondata"))
+                {
+                    if (streams.TryGetValue("TransmissionData", out var tData)) return tData;
+                }
+                else
+                {
+                    foreach (var kvp in streams)
+                    {
+                        if (lowerReq.Contains(kvp.Key.ToLowerInvariant()))
+                            return kvp.Value;
+                    }
+                }
+            }
+            return diskBytes;
+        }
+
+        byte[] bfiBytes = GenerateBasicFileInfo(
+            clientMachine,
+            model.Path,
+            model.ModelGuid,
+            !string.IsNullOrEmpty(model.Version) ? model.Version : effectiveVersion,
+            !string.IsNullOrEmpty(userName) ? userName : "Architect"
+        );
+
+        if (lowerReq.Contains("contents"))
+        {
+            string defaultContentsXml = "<Contents><DocumentVersion>1</DocumentVersion></Contents>";
+            return Encoding.UTF8.GetBytes(defaultContentsXml);
+        }
+
+        return bfiBytes;
+    }
+    public static byte[] CompressToZipDat(byte[] payload)
+    {
+        using var ms = new MemoryStream();
+        using (var archive = new System.IO.Compression.ZipArchive(ms, System.IO.Compression.ZipArchiveMode.Create, leaveOpen: true))
+        {
+            var entry = archive.CreateEntry("data");
+            using var es = entry.Open();
+            es.Write(payload, 0, payload.Length);
+        }
+        return ms.ToArray();
+    }
+
+    public static string GetModelDiskPath(string rawPath)
+    {
+        var clean = NormalizePath(rawPath);
+        if (string.IsNullOrEmpty(clean)) clean = "Проект1.rvt";
+        var storageDir = Path.Combine(AppDomain.CurrentDomain.BaseDirectory, "model_storage");
+        if (!Directory.Exists(storageDir)) Directory.CreateDirectory(storageDir);
+        return Path.Combine(storageDir, clean.Replace('/', '_'));
+    }
+
+    public static byte[] CreateMinimalCompoundFile(byte[] basicFileInfoStreamBytes)
+    {
+        int dataSectors = (basicFileInfoStreamBytes.Length + 511) / 512;
+        int totalSectors = 2 + dataSectors;
+
+        byte[] fileBytes = new byte[(1 + totalSectors) * 512];
+
+        fileBytes[0] = 0xD0; fileBytes[1] = 0xCF; fileBytes[2] = 0x11; fileBytes[3] = 0xE0;
+        fileBytes[4] = 0xA1; fileBytes[5] = 0xB1; fileBytes[6] = 0x1A; fileBytes[7] = 0xE1;
+        
+        fileBytes[24] = 0x3E; fileBytes[25] = 0x00;
+        fileBytes[26] = 0x03; fileBytes[27] = 0x00;
+        fileBytes[28] = 0xFE; fileBytes[29] = 0xFF;
+        fileBytes[30] = 0x09; fileBytes[31] = 0x00;
+        fileBytes[32] = 0x06; fileBytes[33] = 0x00;
+        
+        BitConverter.GetBytes((int)1).CopyTo(fileBytes, 44);
+        BitConverter.GetBytes((int)1).CopyTo(fileBytes, 48);
+        BitConverter.GetBytes((int)4096).CopyTo(fileBytes, 56);
+        BitConverter.GetBytes((int)-2).CopyTo(fileBytes, 60);
+        BitConverter.GetBytes((int)-2).CopyTo(fileBytes, 68);
+        
+        BitConverter.GetBytes((int)0).CopyTo(fileBytes, 76);
+        for (int i = 1; i < 109; i++)
+        {
+            BitConverter.GetBytes((int)-1).CopyTo(fileBytes, 76 + i * 4);
+        }
+
+        BitConverter.GetBytes((int)-3).CopyTo(fileBytes, 512 + 0 * 4);
+        BitConverter.GetBytes((int)-2).CopyTo(fileBytes, 512 + 1 * 4);
+        
+        for (int s = 0; s < dataSectors; s++)
+        {
+            int currentSector = 2 + s;
+            int nextSector = (s == dataSectors - 1) ? -2 : currentSector + 1;
+            BitConverter.GetBytes(nextSector).CopyTo(fileBytes, 512 + currentSector * 4);
+        }
+        
+        for (int i = 2 + dataSectors; i < 128; i++)
+        {
+            BitConverter.GetBytes((int)-1).CopyTo(fileBytes, 512 + i * 4);
+        }
+
+        string rootName = "Root Entry";
+        for (int i = 0; i < rootName.Length; i++)
+        {
+            BitConverter.GetBytes((ushort)rootName[i]).CopyTo(fileBytes, 1024 + i * 2);
+        }
+        fileBytes[1024 + 64] = (byte)((rootName.Length + 1) * 2);
+        fileBytes[1024 + 66] = 0x05;
+        BitConverter.GetBytes((int)-1).CopyTo(fileBytes, 1024 + 68);
+        BitConverter.GetBytes((int)-1).CopyTo(fileBytes, 1024 + 72);
+        BitConverter.GetBytes((int)1).CopyTo(fileBytes, 1024 + 76);
+        BitConverter.GetBytes((int)-2).CopyTo(fileBytes, 1024 + 116);
+        BitConverter.GetBytes((long)0).CopyTo(fileBytes, 1024 + 120);
+
+        int entry1Offset = 1024 + 128;
+        string bfiName = "BasicFileInfo";
+        for (int i = 0; i < bfiName.Length; i++)
+        {
+            BitConverter.GetBytes((ushort)bfiName[i]).CopyTo(fileBytes, entry1Offset + i * 2);
+        }
+        fileBytes[entry1Offset + 64] = (byte)((bfiName.Length + 1) * 2);
+        fileBytes[entry1Offset + 66] = 0x02;
+        BitConverter.GetBytes((int)-1).CopyTo(fileBytes, entry1Offset + 68);
+        BitConverter.GetBytes((int)-1).CopyTo(fileBytes, entry1Offset + 72);
+        BitConverter.GetBytes((int)-1).CopyTo(fileBytes, entry1Offset + 76);
+        BitConverter.GetBytes((int)2).CopyTo(fileBytes, entry1Offset + 116);
+        BitConverter.GetBytes((long)basicFileInfoStreamBytes.Length).CopyTo(fileBytes, entry1Offset + 120);
+
+        for (int e = 2; e < 4; e++) {
+            fileBytes[1024 + e * 128 + 66] = 0x00;
+        }
+
+        int dataStartOffset = 512 * (1 + 2);
+        Array.Copy(basicFileInfoStreamBytes, 0, fileBytes, dataStartOffset, basicFileInfoStreamBytes.Length);
+
+        return fileBytes;
+    }
+
+    public static byte[] GetOrCreateModelBytes(ServerModelItem model, string clientMachine, string userName, string effectiveVersion)
+    {
+        string diskPath = GetModelDiskPath(model.Path);
+        if (File.Exists(diskPath))
+        {
+            try { return File.ReadAllBytes(diskPath); } catch {}
+        }
+        
+        byte[] bfiBytes = GenerateBasicFileInfo(
+            clientMachine,
+            model.Path,
+            model.ModelGuid,
+            !string.IsNullOrEmpty(model.Version) ? model.Version : effectiveVersion,
+            !string.IsNullOrEmpty(userName) ? userName : "Architect"
+        );
+        byte[] cfbf = CreateMinimalCompoundFile(bfiBytes);
+        try { File.WriteAllBytes(diskPath, cfbf); } catch {}
+        return cfbf;
+    }
+
     public static volatile string ConfiguredVersion = Environment.GetEnvironmentVariable("REVIT_SERVER_VERSION") ?? "AUTO";
     public static volatile string ActiveDetectedVersion = "2025.0";
     public static readonly ConcurrentQueue<LiveRequestLog> RecentLogs = new();
@@ -995,7 +1254,103 @@ public static class ServerState
             ClientActiveModelMap[clientKey] = model.Path;
         }
 
-        return model;
+        return model!;
+    }
+
+    private static void WriteBfiString(BinaryWriter writer, string? content)
+    {
+        if (content == null)
+        {
+            writer.Write((int)0);
+            return;
+        }
+        writer.Write((int)content.Length);
+        if (content.Length > 0)
+        {
+            writer.Write(content.ToCharArray());
+        }
+    }
+
+    public static byte[] GenerateBasicFileInfo(string serverHost, string modelPath, string modelGuid, string version, string userName)
+    {
+        var versionYear = version.Split('.')[0].Trim();
+        if (string.IsNullOrEmpty(versionYear) || versionYear.Length != 4) versionYear = "2025";
+        var buildNumber = version.Contains('.') ? version : $"{versionYear}.0";
+
+        var centralPath = $"RSN://{serverHost}/{modelPath}";
+        var episodeGuid = Guid.NewGuid().ToString();
+
+        using var ms = new MemoryStream();
+        using (var writer = new BinaryWriter(ms, Encoding.Unicode, leaveOpen: true))
+        {
+            // 1. Version: BFISV_Max = 15
+            writer.Write((int)14);
+            // 2. IsWorkshared: true
+            writer.Write(true);
+            // 3. WorksharingState: 0 (WS_Central)
+            writer.Write((byte)0);
+            // 4. Username
+            WriteBfiString(writer, userName);
+            // 5. CentralPath
+            WriteBfiString(writer, centralPath);
+            // 6. Format (>= 12)
+            WriteBfiString(writer, versionYear);
+            // BuildVersion
+            WriteBfiString(writer, buildNumber);
+            // 7. SavedPath (>= 1)
+            WriteBfiString(writer, centralPath);
+            // 8. OpenWorksetDefault (>= 3)
+            writer.Write((int)3);
+            // 9. IsLT (>= 4)
+            writer.Write(false);
+            // 10. CentralModelIdentity (>= 5)
+            WriteBfiString(writer, modelGuid);
+            // 11. LocaleWhenSaved (>= 6)
+            WriteBfiString(writer, "ENU");
+            // 12. AllLocalChangesSavedToCentral (>= 7)
+            writer.Write(true);
+            // 13. LatestCentralVersionAndEpisode (>= 8)
+            writer.Write((int)1);
+            WriteBfiString(writer, episodeGuid);
+            // 14. UniqueDocumentVersionIdentifier (>= 9)
+            WriteBfiString(writer, Guid.NewGuid().ToString());
+            WriteBfiString(writer, "1");
+            // 15. ModelIdentity (>= 10)
+            WriteBfiString(writer, modelGuid);
+            // 16. IsSingleUserCloudModel (>= 11)
+            writer.Write(false);
+            // 17. Author (>= 13)
+            WriteBfiString(writer, "Autodesk Revit");
+            // 18. ClientAppName (>= 14)
+            WriteBfiString(writer, "RevitApplication");
+
+            // Text representation section
+            string textRepresentation =
+                "Worksharing: Central\r\n" +
+                $"Username: {userName}\r\n" +
+                $"Central Model Path: {centralPath}\r\n" +
+                $"Format: {versionYear}\r\n" +
+                $"Build: {buildNumber}\r\n" +
+                $"Last Save Path: {centralPath}\r\n" +
+                "Open Workset Default: 3\r\n" +
+                "Revit LT File: False\r\n" +
+                $"Central Model Identity: {modelGuid}\r\n" +
+                "Locale When Saved: ENU\r\n" +
+                "All Local Changes Saved To Central: True\r\n" +
+                "Central model's version number corresponding to the last reload latest: 1\r\n" +
+                $"Central model's episode GUID corresponding to the last reload latest: GUID{episodeGuid}\r\n" +
+                $"The unique document version identifier is {modelGuid} for 1 saves.\r\n" +
+                $"Model Identity: {modelGuid}\r\n" +
+                "Model is singleUserCloudModel: False\r\n" +
+                "Author: Autodesk Revit\r\n" +
+                "ClientAppName: RevitApplication\r\n";
+
+            writer.Write("\r\n");
+            writer.Write(textRepresentation.ToCharArray());
+            writer.Write("\r\n");
+        }
+
+        return ms.ToArray();
     }
 
     public static string EffectiveVersion
@@ -1070,6 +1425,16 @@ public interface IUniversalAdminService
     CoreWCF.Channels.Message ProcessMessage(CoreWCF.Channels.Message request);
 }
 
+[DataContract(Name = "VersionNumber", Namespace = "http://Autodesk.RevitServer.Enterprise.DataContract.Model")]
+public class HeaderVersionNumber
+{
+    [DataMember(Name = "Major")]
+    public int Major { get; set; } = -1;
+
+    [DataMember(Name = "Minor")]
+    public int Minor { get; set; }
+}
+
 [ServiceBehavior(AddressFilterMode = AddressFilterMode.Any)]
 public class UniversalModelService : IUniversalModelService, IUniversalLocalService, IUniversalAdminService
 {
@@ -1097,6 +1462,7 @@ public class UniversalModelService : IUniversalModelService, IUniversalLocalServ
 
         var effectiveMachine = !string.IsNullOrEmpty(serverHost) ? serverHost : "127.0.0.1";
         var userName = "user";
+        int? latestModelVersionNumber = null;
 
         Console.WriteLine($"[CoreWCF] >>> REQUEST RECEIVED: Action='{action}', To='{toUri}', Version='{effectiveVersion}', Host='{serverHost}'");
 
@@ -1436,6 +1802,7 @@ public class UniversalModelService : IUniversalModelService, IUniversalLocalServ
         else if (methodName.Contains("LatestModelVersion", StringComparison.OrdinalIgnoreCase))
         {
             var model = ServerState.ResolveModel(requestBodyXml, "Проект1.rvt", overrideGuid: incomingModelGuid);
+            latestModelVersionNumber = model.VersionNumber;
 
             Console.WriteLine($"[CoreWCF] -> Returning LatestModelVersion for '{model.Path}' (VersionNumber: {model.VersionNumber}, GUID: '{model.ModelGuid}') (Namespace: '{ns}')");
             ServerState.RecordLog("WCF-TCP", "LatestModelVersion", toUri, action, effectiveVersion, 200, $"LatestModelVersion: {model.VersionNumber}");
@@ -1585,12 +1952,13 @@ public class UniversalModelService : IUniversalModelService, IUniversalLocalServ
         }
         else if (methodName.Contains("LatestStreamVersion", StringComparison.OrdinalIgnoreCase))
         {
-            Console.WriteLine($"[CoreWCF] -> Returning LatestStreamVersion: 1 (Namespace: '{ns}')");
-            ServerState.RecordLog("WCF-TCP", "LatestStreamVersion", toUri, action, effectiveVersion, 200, "LatestStreamVersion: 1");
+            Console.WriteLine($"[CoreWCF] -> Returning LatestStreamVersion: 0 (Namespace: '{ns}')");
+            ServerState.RecordLog("WCF-TCP", "LatestStreamVersion", toUri, action, effectiveVersion, 200, "LatestStreamVersion: 0");
 
             responseXml = $"<LatestStreamVersionResponse xmlns=\"{ns}\">" +
                           "<LatestStreamVersionResult xmlns:b=\"http://Autodesk.RevitServer.Enterprise.DataContract.Model\">" +
-                          "<b:Number>1</b:Number>" +
+                          "<b:Major>-1</b:Major>" +
+                          "<b:Minor>0</b:Minor>" +
                           "</LatestStreamVersionResult>" +
                           "</LatestStreamVersionResponse>";
         }
@@ -1641,9 +2009,9 @@ public class UniversalModelService : IUniversalModelService, IUniversalLocalServ
             ServerState.RecordLog("WCF-TCP", "LockData", toUri, action, effectiveVersion, 200, $"LockData OK: {episodeGuid}");
 
             responseXml = $"<LockDataResponse xmlns=\"{ns}\">" +
-                          "<LockDataResult>Locked</LockDataResult>" +
-                          "<creationDate xmlns:b=\"http://Autodesk.RevitServer.Enterprise.DataContract.TransactionalSafety\" xmlns:c=\"http://Autodesk.RevitServer.Enterprise.DataContract.Model\">" +
-                          $"<b:GUIDValue><c:Guid>{episodeGuid}</c:Guid></b:GUIDValue>" +
+                          "<LockDataResult xmlns=\"http://Autodesk.RevitServer.Enterprise.Services.Protected.Model\">Locked</LockDataResult>" +
+                          "<creationDate xmlns:b=\"http://Autodesk.RevitServer.Enterprise.DataContract.Model\">" +
+                          $"<b:GUIDValue><b:Guid>{episodeGuid}</b:Guid></b:GUIDValue>" +
                           "</creationDate>" +
                           "</LockDataResponse>";
         }
@@ -1788,36 +2156,36 @@ public class UniversalModelService : IUniversalModelService, IUniversalLocalServ
             var targetQuery = !string.IsNullOrEmpty(mPath) ? mPath : (!string.IsNullOrEmpty(incomingFileId) ? incomingFileId : incomingModelGuid);
             var model = ServerState.ResolveModel(targetQuery, "Проект1.rvt", overrideGuid: incomingModelGuid);
 
-            Console.WriteLine($"[CoreWCF] -> Returning FileDownloadMessageStream for '{targetQuery}' (Resolved Model: '{model.Path}', GUID: '{model.ModelGuid}')");
+            Console.WriteLine($"[CoreWCF] -> Returning FileDownloadMessageStream for '{targetQuery}' (Resolved Model: '{model.Path}', GUID: '{model.ModelGuid}', Version: '{model.Version}')");
             ServerState.RecordLog("WCF-TCP", "DownloadFile", toUri, targetQuery, effectiveVersion, 200, $"FileDownloadMessageStream: {model.Path}");
 
-            var versionYear = model.Version.Split('.')[0].Trim();
-            if (string.IsNullOrEmpty(versionYear) || versionYear.Length != 4) versionYear = "2025";
+            byte[] bfiBytes = ServerState.GenerateBasicFileInfo(
+                effectiveMachine,
+                model.Path,
+                model.ModelGuid,
+                !string.IsNullOrEmpty(model.Version) ? model.Version : effectiveVersion,
+                !string.IsNullOrEmpty(userName) ? userName : "Architect"
+            );
 
-            string basicInfoText =
-                $"Format: {versionYear}\r\n" +
-                $"Build: {model.Version}\r\n" +
-                $"Revit Build: Autodesk Revit {versionYear} ({model.Version})\r\n" +
-                "Worksharing: Server-Based Central\r\n" +
-                $"Central Model Path: RSN://{effectiveMachine}/{model.Path}\r\n" +
-                $"Username: {userName}\r\n" +
-                "All Local Changes Saved To Central: 1\r\n" +
-                "Is Central: 1\r\n" +
-                "Is Workshared: 1\r\n" +
-                $"Central Model Identity: {{{model.ModelGuid}}}\r\n" +
-                $"Last Save Path: RSN://{effectiveMachine}/{model.Path}\r\n";
+            string streamB64 = Convert.ToBase64String(bfiBytes);
 
-            byte[] bytes = System.Text.Encoding.Unicode.GetBytes(basicInfoText);
-            byte[] bytesWithBom = new byte[bytes.Length + 2];
-            bytesWithBom[0] = 0xFF;
-            bytesWithBom[1] = 0xFE;
-            Buffer.BlockCopy(bytes, 0, bytesWithBom, 2, bytes.Length);
-
-            string streamB64 = Convert.ToBase64String(bytesWithBom);
-
-            responseXml = "<FileDownloadMessageStream xmlns=\"http://autodesk.com/files/2009/01\">" +
+            responseXml = "<FileDownloadMessageStream xmlns=\"http://autodesk.com/files/2009/01\" xmlns:b=\"http://Autodesk.RevitServer.Enterprise.Common.ClientServer.DataContract.Message\">" +
                           $"<Stream>{streamB64}</Stream>" +
+                          $"<b:Stream>{streamB64}</b:Stream>" +
                           "</FileDownloadMessageStream>";
+        }
+        else if (methodName.Equals("ReadData", StringComparison.OrdinalIgnoreCase) ||
+                 (methodName.Contains("ReadData", StringComparison.OrdinalIgnoreCase) &&
+                  !methodName.Contains("BeginReadData", StringComparison.OrdinalIgnoreCase) &&
+                  !methodName.Contains("EndReadData", StringComparison.OrdinalIgnoreCase)))
+        {
+            var fileId = Guid.NewGuid().ToString();
+            Console.WriteLine($"[CoreWCF] -> Returning ReadDataResponseMessage (ResourceFileName: {fileId})");
+            ServerState.RecordLog("WCF-TCP", "ReadData", toUri, action, effectiveVersion, 200, $"ReadData: {fileId}");
+
+            responseXml = $"<ReadDataResponseMessage xmlns=\"http://Autodesk.RevitServer.Enterprise.Common.ClientServer.DataContract.Message\">" +
+                          $"<ModelDataResourceFileName>{fileId}</ModelDataResourceFileName>" +
+                          "</ReadDataResponseMessage>";
         }
         else if (methodName.Contains("WriteChunkDataFinish", StringComparison.OrdinalIgnoreCase))
         {
@@ -2140,6 +2508,14 @@ public class UniversalModelService : IUniversalModelService, IUniversalLocalServ
                 reply.Headers.Add(CoreWCF.Channels.MessageHeader.CreateHeader("ScopingId", "http://autodesk.com/files/2009/01", incomingScopingId));
                 reply.Headers.Add(CoreWCF.Channels.MessageHeader.CreateHeader("ScopingId", "http://Autodesk.RevitServer.Enterprise.Common.ClientServer.DataContract.Message", incomingScopingId));
             }
+        }
+
+        if (latestModelVersionNumber.HasValue)
+        {
+            reply.Headers.Add(CoreWCF.Channels.MessageHeader.CreateHeader(
+                "Version",
+                "http://Autodesk.RevitServer.Enterprise.DataContract.Message",
+                new HeaderVersionNumber { Major = -1, Minor = latestModelVersionNumber.Value }));
         }
 
         Console.WriteLine($"[CoreWCF] <<< Reply dispatched: ReplyAction='{replyAction}'");
